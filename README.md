@@ -9,8 +9,8 @@ Claude Desktop  →  claude_code MCP tool  →  tmux session  →  Claude Code (
                         (this repo)
 ```
 
-- **Claude Desktop** holds your project's GDD, design decisions, and full context. It generates prompts and knows what needs to be done next.
-- **Claude Code** runs interactively in a tmux terminal you can watch. It has access to all your configured MCP tools (Roblox Studio, Godot, Blender, etc.) and retains conversation history between calls.
+- **Claude Desktop** holds your project context, design decisions, and task history. It generates prompts and knows what needs to be done next.
+- **Claude Code** runs interactively in a tmux terminal you can watch. It has access to all your configured MCP tools and retains full conversation history between calls.
 - **This server** is the pipe between them — it delivers Desktop's prompts to Code's session and brings the response back.
 
 ## Requirements
@@ -46,40 +46,54 @@ Add this server to your Claude Desktop MCP config (`~/Library/Application Suppor
 }
 ```
 
+Restart Claude Desktop after saving.
+
+## Using the Tool
+
+Once configured, Claude Desktop has access to the `claude_code` tool. When sending a prompt tell Desktop:
+
+- **What to do** — the task or question for Claude Code
+- **Which project** — pass `workFolder` as the absolute path to your project directory
+
+Example instruction to Desktop:
+> Use the claude_code tool with workFolder `/Users/you/my-project` and ask Claude Code to implement the feature we just designed.
+
+Everything else is automatic — the tmux session and Claude Code instance are created on first use.
+
 ## Session Naming
 
-The tmux session name is always `claude-{basename_of_workFolder}`:
+The tmux session name is derived from your project folder's basename:
 
 | workFolder | Session name |
 |---|---|
-| `/Users/you/my-roblox-game` | `claude-my-roblox-game` |
+| `/Users/you/my-project` | `claude-my-project` |
 | `/Users/you/other-project` | `claude-other-project` |
 | *(not provided)* | `claude-code` |
+
+## Watching Claude Work
+
+Sessions run in the background automatically. Attach any time to watch:
+
+```bash
+tmux attach -t claude-my-project
+# Detach with Ctrl+B D
+```
 
 ## Tool Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `prompt` | string | yes | The prompt to send to Claude Code |
-| `workFolder` | string | no | Project path — used to identify the session |
-| `timeout` | number | no | Max seconds to wait (default: 300) |
+| `workFolder` | string | no | Absolute path to project — determines the session |
+| `timeout` | number | no | Max seconds to wait for a response (default: 300) |
 
 ## Behaviour
 
 - **Session not found** — auto-creates the tmux session rooted at `workFolder`
 - **Claude Code not running** — auto-launches `claude` in the session and waits up to 30s for it to be ready
 - **Session busy** — rejects with a "still busy" message; does not queue
-- **Timeout** — returns a message; session stays marked busy until Claude finishes
+- **Timeout** — auto-recovers on next call by checking if Claude has since finished
 - **Conversation history** — fully preserved between calls (same interactive session)
-
-### Watching Claude work
-
-The session runs in the background automatically. If you want to watch:
-
-```bash
-tmux attach -t claude-my-roblox-game
-# Detach anytime with Ctrl+B D
-```
 
 ## Environment Variables
 
