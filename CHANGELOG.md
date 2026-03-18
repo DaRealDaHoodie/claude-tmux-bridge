@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0] - 2026-03-18
+
+### Added
+- Auto-create tmux session if it doesn't exist (rooted at `workFolder`)
+- Auto-launch Claude Code in the session if it isn't running, with up to 30s startup polling
+- Sessions and Claude Code now spin up fully automatically on first use
+
 ## [2.0.0] - 2026-03-17
 
 Complete architectural rewrite — tmux bridge replaces one-shot spawn mode.

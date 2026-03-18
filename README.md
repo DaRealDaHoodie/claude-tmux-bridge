@@ -31,25 +31,7 @@ npm install
 npm run build
 ```
 
-### 2. Start a tmux session for your project
-
-The session name is derived from your project folder's basename:
-
-```bash
-# For a project at /Users/you/my-roblox-game, the session name is: claude-my-roblox-game
-tmux new-session -s claude-my-roblox-game
-cd /Users/you/my-roblox-game
-claude
-```
-
-To watch the session from another terminal window:
-
-```bash
-tmux attach -t claude-my-roblox-game
-# Detach anytime with Ctrl+B D
-```
-
-### 3. Configure Claude Desktop
+### 2. Configure Claude Desktop
 
 Add this server to your Claude Desktop MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -84,11 +66,20 @@ The tmux session name is always `claude-{basename_of_workFolder}`:
 
 ## Behaviour
 
-- **Session not found** — returns instructions to create one
-- **Claude Code not running** — returns instructions to start it
+- **Session not found** — auto-creates the tmux session rooted at `workFolder`
+- **Claude Code not running** — auto-launches `claude` in the session and waits up to 30s for it to be ready
 - **Session busy** — rejects with a "still busy" message; does not queue
 - **Timeout** — returns a message; session stays marked busy until Claude finishes
 - **Conversation history** — fully preserved between calls (same interactive session)
+
+### Watching Claude work
+
+The session runs in the background automatically. If you want to watch:
+
+```bash
+tmux attach -t claude-my-roblox-game
+# Detach anytime with Ctrl+B D
+```
 
 ## Environment Variables
 

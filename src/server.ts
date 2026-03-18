@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
 // Claude Code MCP — tmux bridge
-// Communicates with an interactive `claude` session running in a tmux terminal
-// instead of spawning a fresh one-shot process per call.
+// Communicates with an interactive `claude` session running in a tmux terminal.
+// Sessions and Claude Code are auto-created if they don't exist.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -20,16 +20,22 @@ import { join, basename } from 'node:path';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const SERVER_VERSION = '2.0.0';
+const SERVER_VERSION = '2.1.0';
 
-/** ms to wait after sending the prompt before starting to poll */
+/** ms to wait after sending a prompt before starting to poll for output */
 const STARTUP_DELAY_MS = 2_000;
 
-/** Polling interval while waiting for output to stabilise */
+/** Polling interval while waiting for Claude's output to stabilise */
 const POLL_INTERVAL_MS = 1_500;
 
-/** How long output must be unchanged before we consider the response done */
+/** How long output must be unchanged before the response is considered done */
 const STABLE_THRESHOLD_MS = 5_000;
+
+/** How often to poll while waiting for Claude Code to start up */
+const CLAUDE_READY_POLL_MS = 1_500;
+
+/** Max time to wait for Claude Code to become ready after launching */
+const CLAUDE_READY_TIMEOUT_MS = 30_000;
 
 /**
  * pane_current_command values that indicate Claude Code is running.
@@ -112,12 +118,61 @@ async function sessionExists(session: string): Promise<boolean> {
   }
 }
 
+/**
+ * Create a new detached tmux session, optionally rooted at workFolder.
+ */
+async function createSession(session: string, workFolder?: string): Promise<void> {
+  const args = ['new-session', '-d', '-s', session];
+  if (workFolder) args.push('-c', workFolder);
+  await spawnAsync('tmux', args);
+  debugLog(`created session ${session}`);
+}
+
 /** Returns the foreground command running in pane 0 of the session. */
 async function paneCommand(session: string): Promise<string> {
   const { stdout } = await spawnAsync('tmux', [
     'display-message', '-t', `${session}:0.0`, '-p', '#{pane_current_command}',
   ]);
   return stdout.trim();
+}
+
+/**
+ * Launch Claude Code in the session's first pane and wait until it is ready.
+ * Polls until pane_current_command is a Claude process AND pane content
+ * has been stable for two consecutive polls (UI fully rendered).
+ */
+async function startClaudeAndWait(session: string): Promise<void> {
+  await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, 'claude', 'Enter']);
+  debugLog(`sent 'claude' to session ${session}, waiting for ready...`);
+
+  const deadline = Date.now() + CLAUDE_READY_TIMEOUT_MS;
+  let lastContent = '';
+  let stableCount = 0;
+
+  while (Date.now() < deadline) {
+    await sleep(CLAUDE_READY_POLL_MS);
+
+    const cmd = await paneCommand(session).catch(() => '');
+    if (!CLAUDE_COMMANDS.has(cmd.toLowerCase())) {
+      stableCount = 0;
+      continue;
+    }
+
+    // Process is running — wait for the UI to stop rendering
+    const content = await capturePane(session);
+    if (content === lastContent && content.trim().length > 20) {
+      stableCount++;
+      if (stableCount >= 2) {
+        debugLog(`Claude Code ready in session ${session}`);
+        return;
+      }
+    } else {
+      stableCount = 0;
+      lastContent = content;
+    }
+  }
+
+  throw new Error('CLAUDE_STARTUP_TIMEOUT');
 }
 
 /**
@@ -223,19 +278,18 @@ class ClaudeCodeServer {
         name: 'claude_code',
         description:
           `Send a prompt to an interactive Claude Code session running in a tmux terminal.\n\n` +
-          `REQUIREMENTS:\n` +
-          `  • A tmux session named claude-{basename_of_workFolder} must already exist.\n` +
-          `  • Claude Code must be running interactively in that session (run: claude).\n` +
-          `  • Only one prompt at a time per session — concurrent calls return a busy error.\n\n` +
+          `Sessions and Claude Code are started automatically if not already running. ` +
+          `The user can attach to the session at any time to watch Claude work:\n` +
+          `  tmux attach -t {session-name}\n\n` +
           `SESSION NAMING:\n` +
-          `  workFolder /Users/you/my-roblox-game → session name: claude-my-roblox-game\n` +
-          `  No workFolder → session name: claude-code\n\n` +
-          `TO START A SESSION (user does this once per project):\n` +
-          `  tmux new-session -s claude-my-project\n` +
-          `  cd /path/to/project\n` +
-          `  claude\n\n` +
-          `Claude Code retains full conversation history between calls.\n` +
-          `It has access to all configured MCP tools (Roblox Studio, Godot, Blender, etc.).`,
+          `  workFolder /Users/you/my-roblox-game → session: claude-my-roblox-game\n` +
+          `  No workFolder → session: claude-code\n\n` +
+          `BEHAVIOUR:\n` +
+          `  • If the tmux session doesn't exist it is created automatically.\n` +
+          `  • If Claude Code isn't running in the session it is started automatically.\n` +
+          `  • Only one prompt at a time per session — concurrent calls return a busy error.\n` +
+          `  • Conversation history is fully preserved between calls.\n` +
+          `  • Claude Code has access to all configured MCP tools (Roblox Studio, Godot, Blender, etc.).`,
         inputSchema: {
           type: 'object',
           properties: {
@@ -246,9 +300,9 @@ class ClaudeCodeServer {
             workFolder: {
               type: 'string',
               description:
-                'Absolute path to the project folder. Its basename determines the tmux session name. ' +
-                'E.g. /Users/foo/my-project → session "claude-my-project". ' +
-                'Omit to use the default session "claude-code".',
+                'Absolute path to the project folder. Determines the tmux session name and ' +
+                'sets the working directory when creating a new session. ' +
+                'E.g. /Users/foo/my-project → session "claude-my-project".',
             },
             timeout: {
               type: 'number',
@@ -283,48 +337,48 @@ class ClaudeCodeServer {
 
       debugLog(`call session=${session} timeout=${timeoutMs / 1000}s`);
 
-      // ── a. Session must exist ──────────────────────────────────────────────
+      // ── a. Ensure session exists (auto-create if needed) ──────────────────
       if (!(await sessionExists(session))) {
-        const createCmd = workFolder
-          ? `tmux new-session -s ${session} -c "${workFolder}"`
-          : `tmux new-session -s ${session}`;
-        return {
-          content: [{
-            type: 'text',
-            text:
-              `No tmux session named "${session}" found.\n\n` +
-              `Create one and start Claude Code:\n` +
-              `  ${createCmd}\n` +
-              `  claude\n\n` +
-              `Attach to watch it work: tmux attach -t ${session}`,
-          }],
-        };
+        debugLog(`session ${session} not found — creating`);
+        try {
+          await createSession(session, workFolder);
+        } catch (err) {
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `Failed to create tmux session "${session}": ${err}\n\n` +
+                `Is tmux installed? Run: brew install tmux`,
+            }],
+          };
+        }
       }
 
-      // ── b. Claude must be running in the pane ─────────────────────────────
-      let cmd: string;
-      try {
-        cmd = await paneCommand(session);
-      } catch (err) {
-        return {
-          content: [{
-            type: 'text',
-            text: `Could not read pane state for session "${session}": ${err}`,
-          }],
-        };
-      }
-
+      // ── b. Ensure Claude Code is running (auto-start if needed) ───────────
+      const cmd = await paneCommand(session).catch(() => '');
       if (!CLAUDE_COMMANDS.has(cmd.toLowerCase())) {
-        return {
-          content: [{
-            type: 'text',
-            text:
-              `Session "${session}" exists but the foreground process is "${cmd}", not Claude Code.\n\n` +
-              `Start Claude Code:\n` +
-              `  tmux send-keys -t ${session} 'claude' Enter\n` +
-              `Or attach and run it yourself: tmux attach -t ${session}`,
-          }],
-        };
+        debugLog(`Claude not running in ${session} — starting`);
+        try {
+          await startClaudeAndWait(session);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg === 'CLAUDE_STARTUP_TIMEOUT') {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Claude Code was launched in session "${session}" but did not become ready within 30s.\n\n` +
+                  `Attach to check what happened: tmux attach -t ${session}`,
+              }],
+            };
+          }
+          return {
+            content: [{
+              type: 'text',
+              text: `Failed to start Claude Code in session "${session}": ${err}`,
+            }],
+          };
+        }
       }
 
       // ── c. Busy check ─────────────────────────────────────────────────────
