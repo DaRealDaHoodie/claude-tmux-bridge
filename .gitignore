@@ -24,3 +24,14 @@ coverage/
 # IDE
 .vscode/
 .idea/
+.cursor/
+
+# Logs
+logs/
+*.log
+
+# Root-level JS build artifacts
+/*.js
+
+# npm auth
+.npmrc
