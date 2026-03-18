@@ -1,4 +1,4 @@
-# Changelog
+# Changelog\n\n## [2.2.0] - 2026-03-18\n\n### Changed\n- **Primary completion signal**: detect Claude Code's `>` idle prompt directly instead of waiting for full stability timeout — dramatically reduces latency on short and medium tasks\n- **Reduced defaults**: `STARTUP_DELAY_MS` 2000→1000, `STABLE_THRESHOLD_MS` 5000→3000\n- **Tunable via env vars**: `MCP_STARTUP_DELAY_MS`, `MCP_POLL_INTERVAL_MS`, `MCP_STABLE_THRESHOLD_MS`, `MCP_CLAUDE_READY_TIMEOUT`
 
 ## [2.1.0] - 2026-03-18
 

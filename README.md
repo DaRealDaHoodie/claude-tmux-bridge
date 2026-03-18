@@ -83,9 +83,13 @@ tmux attach -t claude-my-roblox-game
 
 ## Environment Variables
 
-| Variable | Description |
-|---|---|
-| `MCP_CLAUDE_DEBUG` | Set to `true` for verbose debug logging |
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_CLAUDE_DEBUG` | `false` | Set to `true` for verbose debug logging |
+| `MCP_STARTUP_DELAY_MS` | `1000` | Wait after sending prompt before polling starts |
+| `MCP_POLL_INTERVAL_MS` | `1500` | How often to poll the pane for output changes |
+| `MCP_STABLE_THRESHOLD_MS` | `3000` | Fallback: ms of no change before declaring done |
+| `MCP_CLAUDE_READY_TIMEOUT` | `30000` | Max ms to wait for Claude Code to start up |
 
 ## Multiple Projects
 

@@ -20,22 +20,27 @@ import { join, basename } from 'node:path';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const SERVER_VERSION = '2.1.0';
+const SERVER_VERSION = '2.2.0';
 
-/** ms to wait after sending a prompt before starting to poll for output */
-const STARTUP_DELAY_MS = 2_000;
+function envInt(name: string, defaultVal: number): number {
+  const val = parseInt(process.env[name] ?? '', 10);
+  return isNaN(val) ? defaultVal : val;
+}
 
-/** Polling interval while waiting for Claude's output to stabilise */
-const POLL_INTERVAL_MS = 1_500;
-
-/** How long output must be unchanged before the response is considered done */
-const STABLE_THRESHOLD_MS = 5_000;
-
-/** How often to poll while waiting for Claude Code to start up */
-const CLAUDE_READY_POLL_MS = 1_500;
-
-/** Max time to wait for Claude Code to become ready after launching */
-const CLAUDE_READY_TIMEOUT_MS = 30_000;
+/**
+ * Timing constants — all tunable via environment variables.
+ * Defaults are conservative; reduce them if your tasks complete quickly.
+ *
+ *   MCP_STARTUP_DELAY_MS      Wait after sending prompt before polling (default: 1000)
+ *   MCP_POLL_INTERVAL_MS      How often to poll the pane (default: 1500)
+ *   MCP_STABLE_THRESHOLD_MS   Fallback: ms of no change = done (default: 3000)
+ *   MCP_CLAUDE_READY_TIMEOUT  Max ms to wait for Claude Code to start (default: 30000)
+ */
+const STARTUP_DELAY_MS       = envInt('MCP_STARTUP_DELAY_MS',     1_000);
+const POLL_INTERVAL_MS       = envInt('MCP_POLL_INTERVAL_MS',     1_500);
+const STABLE_THRESHOLD_MS    = envInt('MCP_STABLE_THRESHOLD_MS',  3_000);
+const CLAUDE_READY_POLL_MS   = 1_500;
+const CLAUDE_READY_TIMEOUT_MS = envInt('MCP_CLAUDE_READY_TIMEOUT', 30_000);
 
 /**
  * pane_current_command values that indicate Claude Code is running.
@@ -226,8 +231,21 @@ async function sendPrompt(session: string, prompt: string): Promise<void> {
 }
 
 /**
- * Poll the pane until output has been stable for STABLE_THRESHOLD_MS,
- * then return the full captured content. Throws 'TIMEOUT' on timeout.
+ * Returns true if the pane content ends with Claude Code's idle prompt.
+ * Claude Code shows a line containing only ">" when waiting for input.
+ * This is the primary completion signal — much faster than waiting for
+ * the full stability threshold.
+ */
+function isAtClaudePrompt(content: string): boolean {
+  const lines = content.trimEnd().split('\n');
+  // Check the last 3 lines in case there's trailing whitespace
+  return lines.slice(-3).some((line) => /^\s*>\s*$/.test(line));
+}
+
+/**
+ * Poll the pane until Claude Code's idle prompt is detected (primary signal)
+ * or output has been stable for STABLE_THRESHOLD_MS (fallback).
+ * Throws 'TIMEOUT' on timeout.
  */
 async function waitForStableOutput(session: string, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
@@ -247,7 +265,14 @@ async function waitForStableOutput(session: string, timeoutMs: number): Promise<
       lastContent = current;
       lastChangeAt = Date.now();
       everChanged = true;
+
+      // Primary signal: Claude Code's ">" prompt returned — done immediately
+      if (everChanged && isAtClaudePrompt(current)) {
+        debugLog('Claude prompt detected — done');
+        return current;
+      }
     } else if (everChanged && Date.now() - lastChangeAt >= STABLE_THRESHOLD_MS) {
+      // Fallback: content hasn't changed for STABLE_THRESHOLD_MS
       debugLog(`stable for ${Date.now() - lastChangeAt}ms — done`);
       return current;
     }
@@ -278,7 +303,7 @@ class ClaudeCodeServer {
 
   constructor() {
     this.server = new Server(
-      { name: 'claude_code', version: SERVER_VERSION },
+      { name: 'claude_tmux_bridge', version: SERVER_VERSION },
       { capabilities: { tools: {} } },
     );
     this.setupHandlers();
