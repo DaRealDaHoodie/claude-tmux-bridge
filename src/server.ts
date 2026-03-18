@@ -65,6 +65,23 @@ const busySessions = new Set<string>();
  */
 const timedOutSessions = new Set<string>();
 
+/** Exported only for use in tests — clears all session state between test runs. */
+export function _clearSessionsForTesting(): void {
+  busySessions.clear();
+  timedOutSessions.clear();
+}
+
+/** Exported only for use in tests — marks a session as busy. */
+export function _markBusyForTesting(session: string): void {
+  busySessions.add(session);
+}
+
+/** Exported only for use in tests — marks a session as busy + timed-out. */
+export function _markTimedOutForTesting(session: string): void {
+  busySessions.add(session);
+  timedOutSessions.add(session);
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 function debugLog(...args: unknown[]): void {
@@ -113,7 +130,7 @@ function spawnAsync(
  *   /Users/foo/my-roblox-game  →  claude-my-roblox-game
  *   (none)                     →  claude-code
  */
-function sessionName(workFolder?: string): string {
+export function sessionName(workFolder?: string): string {
   if (!workFolder) return 'claude-code';
   const base = basename(workFolder.replace(/\/+$/, ''));
   const safe = base.replace(/[^a-zA-Z0-9_.\-]/g, '-');
@@ -236,7 +253,7 @@ async function sendPrompt(session: string, prompt: string): Promise<void> {
  * This is the primary completion signal — much faster than waiting for
  * the full stability threshold.
  */
-function isAtClaudePrompt(content: string): boolean {
+export function isAtClaudePrompt(content: string): boolean {
   const lines = content.trimEnd().split('\n');
   // Check the last 3 lines in case there's trailing whitespace
   return lines.slice(-3).some((line) => /^\s*>\s*$/.test(line));
@@ -286,7 +303,7 @@ async function waitForStableOutput(session: string, timeoutMs: number): Promise<
  * tail of the before snapshot. Falls back to full after-content if the
  * anchor can't be found (e.g. pane was cleared mid-session).
  */
-function extractNewContent(before: string, after: string): string {
+export function extractNewContent(before: string, after: string): string {
   const anchor = before.slice(-200).trim();
   if (!anchor) return after.trim();
 
