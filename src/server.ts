@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude Code MCP — tmux bridge
+// Communicates with an interactive `claude` session running in a tmux terminal
+// instead of spawning a fresh one-shot process per call.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -6,339 +12,379 @@ import {
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
-  type ServerResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve as pathResolve } from 'node:path';
-import * as path from 'path';
-import { readFileSync } from 'node:fs';
+import { mkdtemp, writeFile, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, basename } from 'node:path';
 
-// Server version - update this when releasing new versions
-const SERVER_VERSION = "1.10.12";
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-// Define debugMode globally using const
+const SERVER_VERSION = '2.0.0';
+
+/** ms to wait after sending the prompt before starting to poll */
+const STARTUP_DELAY_MS = 2_000;
+
+/** Polling interval while waiting for output to stabilise */
+const POLL_INTERVAL_MS = 1_500;
+
+/** How long output must be unchanged before we consider the response done */
+const STABLE_THRESHOLD_MS = 5_000;
+
+/**
+ * pane_current_command values that indicate Claude Code is running.
+ * Covers the npm-installed binary (runs as `node`) and a native binary.
+ */
+const CLAUDE_COMMANDS = new Set(['node', 'claude', 'claude-code']);
+
+// ─── Globals ─────────────────────────────────────────────────────────────────
+
 const debugMode = process.env.MCP_CLAUDE_DEBUG === 'true';
 
-// Track if this is the first tool use for version printing
-let isFirstToolUse = true;
+/**
+ * Tracks which tmux sessions are currently processing a prompt.
+ * Prevents concurrent use of the same session.
+ */
+const busySessions = new Set<string>();
 
-// Capture server startup time when the module loads
-const serverStartupTime = new Date().toISOString();
+// ─── Utilities ───────────────────────────────────────────────────────────────
 
-// Dedicated debug logging function
-export function debugLog(message?: any, ...optionalParams: any[]): void {
-  if (debugMode) {
-    console.error(message, ...optionalParams);
-  }
+function debugLog(...args: unknown[]): void {
+  if (debugMode) console.error('[claude-mcp]', ...args);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Determine the Claude CLI command/path.
- * 1. Checks for CLAUDE_CLI_NAME environment variable:
- *    - If absolute path, uses it directly
- *    - If relative path, throws error
- *    - If simple name, continues with path resolution
- * 2. Checks for Claude CLI at the local user path: ~/.claude/local/claude.
- * 3. If not found, defaults to the CLI name (or 'claude'), relying on the system's PATH for lookup.
+ * Run a command without a shell. Rejects on non-zero exit.
+ * Shell is intentionally disabled — arguments are passed verbatim.
  */
-export function findClaudeCli(): string {
-  debugLog('[Debug] Attempting to find Claude CLI...');
-
-  // Check for custom CLI name from environment variable
-  const customCliName = process.env.CLAUDE_CLI_NAME;
-  if (customCliName) {
-    debugLog(`[Debug] Using custom Claude CLI name from CLAUDE_CLI_NAME: ${customCliName}`);
-    
-    // If it's an absolute path, use it directly
-    if (path.isAbsolute(customCliName)) {
-      debugLog(`[Debug] CLAUDE_CLI_NAME is an absolute path: ${customCliName}`);
-      return customCliName;
-    }
-    
-    // If it starts with ~ or ./, reject as relative paths are not allowed
-    if (customCliName.startsWith('./') || customCliName.startsWith('../') || customCliName.includes('/')) {
-      throw new Error(`Invalid CLAUDE_CLI_NAME: Relative paths are not allowed. Use either a simple name (e.g., 'claude') or an absolute path (e.g., '/tmp/claude-test')`);
-    }
-  }
-  
-  const cliName = customCliName || 'claude';
-
-  // Try local install path: ~/.claude/local/claude (using the original name for local installs)
-  const userPath = join(homedir(), '.claude', 'local', 'claude');
-  debugLog(`[Debug] Checking for Claude CLI at local user path: ${userPath}`);
-
-  if (existsSync(userPath)) {
-    debugLog(`[Debug] Found Claude CLI at local user path: ${userPath}. Using this path.`);
-    return userPath;
-  } else {
-    debugLog(`[Debug] Claude CLI not found at local user path: ${userPath}.`);
-  }
-
-  // 3. Fallback to CLI name (PATH lookup)
-  debugLog(`[Debug] Falling back to "${cliName}" command name, relying on spawn/PATH lookup.`);
-  console.warn(`[Warning] Claude CLI not found at ~/.claude/local/claude. Falling back to "${cliName}" in PATH. Ensure it is installed and accessible.`);
-  return cliName;
-}
-
-/**
- * Interface for Claude Code tool arguments
- */
-interface ClaudeCodeArgs {
-  prompt: string;
-  workFolder?: string;
-}
-
-// Ensure spawnAsync is defined correctly *before* the class
-export async function spawnAsync(command: string, args: string[], options?: { timeout?: number, cwd?: string }): Promise<{ stdout: string; stderr: string }> {
+function spawnAsync(
+  command: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    debugLog(`[Spawn] Running command: ${command} ${args.join(' ')}`);
-    const process = spawn(command, args, {
-      shell: false, // Reverted to false
-      timeout: options?.timeout,
-      cwd: options?.cwd,
-      stdio: ['ignore', 'pipe', 'pipe']
+    debugLog('spawn', command, args);
+    const child = spawn(command, args, {
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';
     let stderr = '';
+    child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
 
-    process.stdout.on('data', (data) => { stdout += data.toString(); });
-    process.stderr.on('data', (data) => {
-      stderr += data.toString();
-      debugLog(`[Spawn Stderr Chunk] ${data.toString()}`);
+    child.on('error', (err: Error) => {
+      reject(new Error(`Spawn error for "${command}": ${err.message}`));
     });
-
-    process.on('error', (error: NodeJS.ErrnoException) => {
-      debugLog(`[Spawn Error Event] Full error object:`, error);
-      let errorMessage = `Spawn error: ${error.message}`;
-      if (error.path) {
-        errorMessage += ` | Path: ${error.path}`;
-      }
-      if (error.syscall) {
-        errorMessage += ` | Syscall: ${error.syscall}`;
-      }
-      errorMessage += `\nStderr: ${stderr.trim()}`;
-      reject(new Error(errorMessage));
-    });
-
-    process.on('close', (code) => {
-      debugLog(`[Spawn Close] Exit code: ${code}`);
-      debugLog(`[Spawn Stderr Full] ${stderr.trim()}`);
-      debugLog(`[Spawn Stdout Full] ${stdout.trim()}`);
+    child.on('close', (code) => {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(`Command failed with exit code ${code}\nStderr: ${stderr.trim()}\nStdout: ${stdout.trim()}`));
+        reject(new Error(`"${command}" exited ${code}\nstderr: ${stderr.trim()}\nstdout: ${stdout.trim()}`));
       }
     });
   });
 }
 
 /**
- * MCP Server for Claude Code
- * Provides a simple MCP tool to run Claude CLI in one-shot mode
+ * Derive a tmux session name from an optional workFolder path.
+ *   /Users/foo/my-roblox-game  →  claude-my-roblox-game
+ *   (none)                     →  claude-code
  */
-export class ClaudeCodeServer {
+function sessionName(workFolder?: string): string {
+  if (!workFolder) return 'claude-code';
+  const base = basename(workFolder.replace(/\/+$/, ''));
+  const safe = base.replace(/[^a-zA-Z0-9_.\-]/g, '-');
+  return `claude-${safe}`;
+}
+
+/** Returns true if a tmux session with this name exists. */
+async function sessionExists(session: string): Promise<boolean> {
+  try {
+    await spawnAsync('tmux', ['has-session', '-t', session]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Returns the foreground command running in pane 0 of the session. */
+async function paneCommand(session: string): Promise<string> {
+  const { stdout } = await spawnAsync('tmux', [
+    'display-message', '-t', `${session}:0.0`, '-p', '#{pane_current_command}',
+  ]);
+  return stdout.trim();
+}
+
+/**
+ * Capture the visible + scrollback content of the pane as plain text.
+ * -S -5000 pulls up to 5000 lines of scrollback.
+ */
+async function capturePane(session: string): Promise<string> {
+  const { stdout } = await spawnAsync('tmux', [
+    'capture-pane', '-t', `${session}:0.0`, '-p', '-S', '-5000',
+  ]);
+  return stdout;
+}
+
+/**
+ * Send a prompt to a tmux pane safely, handling all special characters.
+ *
+ * Uses temp-file → tmux load-buffer → paste-buffer → Enter.
+ * This avoids every shell-quoting issue: the file content is treated as
+ * opaque bytes by tmux and pasted literally into the pty.
+ */
+async function sendPrompt(session: string, prompt: string): Promise<void> {
+  const tmpDir = await mkdtemp(join(tmpdir(), 'claude-mcp-'));
+  const tmpFile = join(tmpDir, 'prompt.txt');
+
+  try {
+    await writeFile(tmpFile, prompt, 'utf8');
+    await spawnAsync('tmux', ['load-buffer', '-b', 'claude-mcp', tmpFile]);
+    await spawnAsync('tmux', ['paste-buffer', '-b', 'claude-mcp', '-t', `${session}:0.0`]);
+    await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, 'Enter']);
+  } finally {
+    await unlink(tmpFile).catch(() => {});
+  }
+}
+
+/**
+ * Poll the pane until output has been stable for STABLE_THRESHOLD_MS,
+ * then return the full captured content. Throws 'TIMEOUT' on timeout.
+ */
+async function waitForStableOutput(session: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+
+  await sleep(STARTUP_DELAY_MS);
+
+  let lastContent = await capturePane(session);
+  let lastChangeAt = Date.now();
+  let everChanged = false;
+
+  while (Date.now() < deadline) {
+    await sleep(POLL_INTERVAL_MS);
+
+    const current = await capturePane(session);
+
+    if (current !== lastContent) {
+      lastContent = current;
+      lastChangeAt = Date.now();
+      everChanged = true;
+    } else if (everChanged && Date.now() - lastChangeAt >= STABLE_THRESHOLD_MS) {
+      debugLog(`stable for ${Date.now() - lastChangeAt}ms — done`);
+      return current;
+    }
+  }
+
+  throw new Error('TIMEOUT');
+}
+
+/**
+ * Extract the content that appeared after `before` by anchoring on the
+ * tail of the before snapshot. Falls back to full after-content if the
+ * anchor can't be found (e.g. pane was cleared mid-session).
+ */
+function extractNewContent(before: string, after: string): string {
+  const anchor = before.slice(-200).trim();
+  if (!anchor) return after.trim();
+
+  const idx = after.lastIndexOf(anchor);
+  if (idx === -1) return after.trim();
+
+  return after.slice(idx + anchor.length).trim();
+}
+
+// ─── MCP Server ──────────────────────────────────────────────────────────────
+
+class ClaudeCodeServer {
   private server: Server;
-  private claudeCliPath: string; // This now holds either a full path or just 'claude'
-  private packageVersion: string; // Add packageVersion property
 
   constructor() {
-    // Use the simplified findClaudeCli function
-    this.claudeCliPath = findClaudeCli(); // Removed debugMode argument
-    console.error(`[Setup] Using Claude CLI command/path: ${this.claudeCliPath}`);
-    this.packageVersion = SERVER_VERSION;
-
     this.server = new Server(
-      {
-        name: 'claude_code',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
+      { name: 'claude_code', version: SERVER_VERSION },
+      { capabilities: { tools: {} } },
     );
-
-    this.setupToolHandlers();
-
-    this.server.onerror = (error) => console.error('[Error]', error);
+    this.setupHandlers();
+    this.server.onerror = (err) => console.error('[MCP Error]', err);
     process.on('SIGINT', async () => {
       await this.server.close();
       process.exit(0);
     });
   }
 
-  /**
-   * Set up the MCP tool handlers
-   */
-  private setupToolHandlers(): void {
-    // Define available tools
+  private setupHandlers(): void {
+    // ── List tools ──────────────────────────────────────────────────────────
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'claude_code',
-          description: `Claude Code Agent: Your versatile multi-modal assistant for code, file, Git, and terminal operations via Claude CLI. Use \`workFolder\` for contextual execution.
-
-• File ops: Create, read, (fuzzy) edit, move, copy, delete, list files, analyze/ocr images, file content analysis
-    └─ e.g., "Create /tmp/log.txt with 'system boot'", "Edit main.py to replace 'debug_mode = True' with 'debug_mode = False'", "List files in /src", "Move a specific section somewhere else"
-
-• Code: Generate / analyse / refactor / fix
-    └─ e.g. "Generate Python to parse CSV→JSON", "Find bugs in my_script.py"
-
-• Git: Stage ▸ commit ▸ push ▸ tag (any workflow)
-    └─ "Commit '/workspace/src/main.java' with 'feat: user auth' to develop."
-
-• Terminal: Run any CLI cmd or open URLs
-    └─ "npm run build", "Open https://developer.mozilla.org"
-
-• Web search + summarise content on-the-fly
-
-• Multi-step workflows  (Version bumps, changelog updates, release tagging, etc.)
-
-• GitHub integration  Create PRs, check CI status
-
-• Confused or stuck on an issue? Ask Claude Code for a second opinion, it might surprise you!
-
-**Prompt tips**
-
-1. Be concise, explicit & step-by-step for complex tasks. No need for niceties, this is a tool to get things done.
-2. For multi-line text, write it to a temporary file in the project root, use that file, then delete it.
-3. If you get a timeout, split the task into smaller steps.
-4. **Seeking a second opinion/analysis**: If you're stuck or want advice, you can ask \`claude_code\` to analyze a problem and suggest solutions. Clearly state in your prompt that you are looking for analysis only and no actual file modifications should be made.
-5. If workFolder is set to the project path, there is no need to repeat that path in the prompt and you can use relative paths for files.
-6. Claude Code is really good at complex multi-step file operations and refactorings and faster than your native edit features.
-7. Combine file operations, README updates, and Git commands in a sequence.
-8. Claude can do much more, just ask it!
-
-        `,
-          inputSchema: {
-            type: 'object',
-            properties: {
-              prompt: {
-                type: 'string',
-                description: 'The detailed natural language prompt for Claude to execute.',
-              },
-              workFolder: {
-                type: 'string',
-                description: 'Mandatory when using file operations or referencing any file. The working directory for the Claude CLI execution. Must be an absolute path.',
-              },
+      tools: [{
+        name: 'claude_code',
+        description:
+          `Send a prompt to an interactive Claude Code session running in a tmux terminal.\n\n` +
+          `REQUIREMENTS:\n` +
+          `  • A tmux session named claude-{basename_of_workFolder} must already exist.\n` +
+          `  • Claude Code must be running interactively in that session (run: claude).\n` +
+          `  • Only one prompt at a time per session — concurrent calls return a busy error.\n\n` +
+          `SESSION NAMING:\n` +
+          `  workFolder /Users/you/my-roblox-game → session name: claude-my-roblox-game\n` +
+          `  No workFolder → session name: claude-code\n\n` +
+          `TO START A SESSION (user does this once per project):\n` +
+          `  tmux new-session -s claude-my-project\n` +
+          `  cd /path/to/project\n` +
+          `  claude\n\n` +
+          `Claude Code retains full conversation history between calls.\n` +
+          `It has access to all configured MCP tools (Roblox Studio, Godot, Blender, etc.).`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'The prompt to send to the Claude Code session.',
             },
-            required: ['prompt'],
+            workFolder: {
+              type: 'string',
+              description:
+                'Absolute path to the project folder. Its basename determines the tmux session name. ' +
+                'E.g. /Users/foo/my-project → session "claude-my-project". ' +
+                'Omit to use the default session "claude-code".',
+            },
+            timeout: {
+              type: 'number',
+              description: 'Max seconds to wait for a response (default: 300).',
+            },
           },
-        }
-      ],
+          required: ['prompt'],
+        },
+      }],
     }));
 
-    // Handle tool calls
-    const executionTimeoutMs = 1800000; // 30 minutes timeout
-
-    this.server.setRequestHandler(CallToolRequestSchema, async (args, call): Promise<ServerResult> => {
-      debugLog('[Debug] Handling CallToolRequest:', args);
-
-      // Correctly access toolName from args.params.name
-      const toolName = args.params.name;
-      if (toolName !== 'claude_code') {
-        // ErrorCode.ToolNotFound should be ErrorCode.MethodNotFound as per SDK for tools
-        throw new McpError(ErrorCode.MethodNotFound, `Tool ${toolName} not found`);
+    // ── Handle calls ────────────────────────────────────────────────────────
+    this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
+      if (req.params.name !== 'claude_code') {
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${req.params.name}`);
       }
 
-      // Robustly access prompt from args.params.arguments
-      const toolArguments = args.params.arguments;
-      let prompt: string;
+      const args = req.params.arguments as {
+        prompt?: unknown;
+        workFolder?: unknown;
+        timeout?: unknown;
+      } | undefined;
 
-      if (
-        toolArguments &&
-        typeof toolArguments === 'object' &&
-        'prompt' in toolArguments &&
-        typeof toolArguments.prompt === 'string'
-      ) {
-        prompt = toolArguments.prompt;
-      } else {
-        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: prompt (must be an object with a string "prompt" property) for claude_code tool');
+      if (!args?.prompt || typeof args.prompt !== 'string') {
+        throw new McpError(ErrorCode.InvalidParams, 'prompt (string) is required');
       }
 
-      // Determine the working directory
-      let effectiveCwd = homedir(); // Default CWD is user's home directory
+      const prompt = args.prompt;
+      const workFolder = typeof args.workFolder === 'string' ? args.workFolder : undefined;
+      const timeoutMs = (typeof args.timeout === 'number' ? args.timeout : 300) * 1_000;
+      const session = sessionName(workFolder);
 
-      // Check if workFolder is provided in the tool arguments
-      if (toolArguments.workFolder && typeof toolArguments.workFolder === 'string') {
-        const resolvedCwd = pathResolve(toolArguments.workFolder);
-        debugLog(`[Debug] Specified workFolder: ${toolArguments.workFolder}, Resolved to: ${resolvedCwd}`);
+      debugLog(`call session=${session} timeout=${timeoutMs / 1000}s`);
 
-        // Check if the resolved path exists
-        if (existsSync(resolvedCwd)) {
-          effectiveCwd = resolvedCwd;
-          debugLog(`[Debug] Using workFolder as CWD: ${effectiveCwd}`);
-        } else {
-          debugLog(`[Warning] Specified workFolder does not exist: ${resolvedCwd}. Using default: ${effectiveCwd}`);
-        }
-      } else {
-        debugLog(`[Debug] No workFolder provided, using default CWD: ${effectiveCwd}`);
+      // ── a. Session must exist ──────────────────────────────────────────────
+      if (!(await sessionExists(session))) {
+        const createCmd = workFolder
+          ? `tmux new-session -s ${session} -c "${workFolder}"`
+          : `tmux new-session -s ${session}`;
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `No tmux session named "${session}" found.\n\n` +
+              `Create one and start Claude Code:\n` +
+              `  ${createCmd}\n` +
+              `  claude\n\n` +
+              `Attach to watch it work: tmux attach -t ${session}`,
+          }],
+        };
       }
+
+      // ── b. Claude must be running in the pane ─────────────────────────────
+      let cmd: string;
+      try {
+        cmd = await paneCommand(session);
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Could not read pane state for session "${session}": ${err}`,
+          }],
+        };
+      }
+
+      if (!CLAUDE_COMMANDS.has(cmd.toLowerCase())) {
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `Session "${session}" exists but the foreground process is "${cmd}", not Claude Code.\n\n` +
+              `Start Claude Code:\n` +
+              `  tmux send-keys -t ${session} 'claude' Enter\n` +
+              `Or attach and run it yourself: tmux attach -t ${session}`,
+          }],
+        };
+      }
+
+      // ── c. Busy check ─────────────────────────────────────────────────────
+      if (busySessions.has(session)) {
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `Session "${session}" is currently busy. ` +
+              `Wait for Claude Code to finish before sending another prompt.`,
+          }],
+        };
+      }
+
+      // ── d. Snapshot before ────────────────────────────────────────────────
+      const before = await capturePane(session);
+
+      // ── e. Mark busy ──────────────────────────────────────────────────────
+      busySessions.add(session);
 
       try {
-        debugLog(`[Debug] Attempting to execute Claude CLI with prompt: "${prompt}" in CWD: "${effectiveCwd}"`);
+        // ── f. Send prompt ─────────────────────────────────────────────────
+        await sendPrompt(session, prompt);
 
-        // Print tool info on first use
-        if (isFirstToolUse) {
-          const versionInfo = `claude_code v${SERVER_VERSION} started at ${serverStartupTime}`;
-          console.error(versionInfo);
-          isFirstToolUse = false;
+        // ── g. Wait for completion ─────────────────────────────────────────
+        const after = await waitForStableOutput(session, timeoutMs);
+
+        // ── h. Extract and return new content ──────────────────────────────
+        busySessions.delete(session);
+        const response = extractNewContent(before, after);
+        return { content: [{ type: 'text', text: response || after }] };
+
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg === 'TIMEOUT') {
+          // Leave busy set — Claude may still be working
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `Timeout: Claude Code in session "${session}" did not finish within ${timeoutMs / 1000}s.\n\n` +
+                `The session remains marked busy. If Claude has actually finished, retry — ` +
+                `the next call will re-check live pane state.\n\n` +
+                `Consider splitting this task into smaller steps, or increase the timeout parameter.`,
+            }],
+          };
         }
 
-        const claudeProcessArgs = ['--dangerously-skip-permissions', '-p', prompt];
-        debugLog(`[Debug] Invoking Claude CLI: ${this.claudeCliPath} ${claudeProcessArgs.join(' ')}`);
-
-        const { stdout, stderr } = await spawnAsync(
-          this.claudeCliPath, // Run the Claude CLI directly
-          claudeProcessArgs, // Pass the arguments
-          { timeout: executionTimeoutMs, cwd: effectiveCwd }
-        );
-
-        debugLog('[Debug] Claude CLI stdout:', stdout.trim());
-        if (stderr) {
-          debugLog('[Debug] Claude CLI stderr:', stderr.trim());
-        }
-
-        // Return stdout content, even if there was stderr, as claude-cli might output main result to stdout.
-        return { content: [{ type: 'text', text: stdout }] };
-
-      } catch (error: any) {
-        debugLog('[Error] Error executing Claude CLI:', error);
-        let errorMessage = error.message || 'Unknown error';
-        // Attempt to include stderr and stdout from the error object if spawnAsync attached them
-        if (error.stderr) {
-          errorMessage += `\nStderr: ${error.stderr}`;
-        }
-        if (error.stdout) {
-          errorMessage += `\nStdout: ${error.stdout}`;
-        }
-
-        if (error.signal === 'SIGTERM' || (error.message && error.message.includes('ETIMEDOUT')) || (error.code === 'ETIMEDOUT')) {
-          // Reverting to InternalError due to lint issues, but with a specific timeout message.
-          throw new McpError(ErrorCode.InternalError, `Claude CLI command timed out after ${executionTimeoutMs / 1000}s. Details: ${errorMessage}`);
-        }
-        // ErrorCode.ToolCallFailed should be ErrorCode.InternalError or a more specific execution error if available
-        throw new McpError(ErrorCode.InternalError, `Claude CLI execution failed: ${errorMessage}`);
+        busySessions.delete(session);
+        throw new McpError(ErrorCode.InternalError, `tmux bridge error: ${msg}`);
       }
     });
   }
 
-  /**
-   * Start the MCP server
-   */
   async run(): Promise<void> {
-    // Revert to original server start logic if listen caused errors
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Claude Code MCP server running on stdio');
+    console.error(`Claude Code MCP (tmux bridge) v${SERVER_VERSION} — ready`);
   }
 }
 
-// Create and run the server if this is the main module
-const server = new ClaudeCodeServer();
-server.run().catch(console.error);
+new ClaudeCodeServer().run().catch(console.error);
