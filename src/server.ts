@@ -199,12 +199,12 @@ async function capturePane(session: string): Promise<string> {
 }
 
 /**
- * Quick check to see if the pane has been idle for 3s.
+ * Quick check to see if the pane has been idle for STABLE_THRESHOLD_MS.
  * Used to auto-recover from a stale busy flag after a timeout.
  */
 async function isPaneIdle(session: string): Promise<boolean> {
   const first = await capturePane(session);
-  await sleep(3_000);
+  await sleep(STABLE_THRESHOLD_MS);
   const second = await capturePane(session);
   return first === second;
 }
@@ -496,6 +496,7 @@ class ClaudeCodeServer {
         }
 
         busySessions.delete(session);
+        timedOutSessions.delete(session);
         throw new McpError(ErrorCode.InternalError, `tmux bridge error: ${msg}`);
       }
     });
