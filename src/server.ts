@@ -53,6 +53,13 @@ const debugMode = process.env.MCP_CLAUDE_DEBUG === 'true';
  */
 const busySessions = new Set<string>();
 
+/**
+ * Tracks sessions that hit a timeout. On the next call we check whether
+ * Claude has since finished and auto-recover if so, rather than requiring
+ * a server restart to clear the busy flag.
+ */
+const timedOutSessions = new Set<string>();
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 function debugLog(...args: unknown[]): void {
@@ -184,6 +191,17 @@ async function capturePane(session: string): Promise<string> {
     'capture-pane', '-t', `${session}:0.0`, '-p', '-S', '-5000',
   ]);
   return stdout;
+}
+
+/**
+ * Quick check to see if the pane has been idle for 3s.
+ * Used to auto-recover from a stale busy flag after a timeout.
+ */
+async function isPaneIdle(session: string): Promise<boolean> {
+  const first = await capturePane(session);
+  await sleep(3_000);
+  const second = await capturePane(session);
+  return first === second;
 }
 
 /**
@@ -383,14 +401,36 @@ class ClaudeCodeServer {
 
       // ── c. Busy check ─────────────────────────────────────────────────────
       if (busySessions.has(session)) {
-        return {
-          content: [{
-            type: 'text',
-            text:
-              `Session "${session}" is currently busy. ` +
-              `Wait for Claude Code to finish before sending another prompt.`,
-          }],
-        };
+        // If this session previously timed out, check whether Claude has
+        // since finished. If the pane has been stable for 3s, auto-recover.
+        if (timedOutSessions.has(session)) {
+          debugLog(`session ${session} timed out previously — checking if Claude is now idle`);
+          const idle = await isPaneIdle(session);
+          if (idle) {
+            debugLog(`session ${session} is idle — clearing stale busy flag`);
+            busySessions.delete(session);
+            timedOutSessions.delete(session);
+            // Fall through to normal processing
+          } else {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Session "${session}" is still busy — Claude Code is still working on the previous prompt.\n\n` +
+                  `Attach to check progress: tmux attach -t ${session}`,
+              }],
+            };
+          }
+        } else {
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `Session "${session}" is currently busy. ` +
+                `Wait for Claude Code to finish before sending another prompt.`,
+            }],
+          };
+        }
       }
 
       // ── d. Snapshot before ────────────────────────────────────────────────
@@ -408,6 +448,7 @@ class ClaudeCodeServer {
 
         // ── h. Extract and return new content ──────────────────────────────
         busySessions.delete(session);
+        timedOutSessions.delete(session);
         const response = extractNewContent(before, after);
         return { content: [{ type: 'text', text: response || after }] };
 
@@ -415,14 +456,15 @@ class ClaudeCodeServer {
         const msg = err instanceof Error ? err.message : String(err);
 
         if (msg === 'TIMEOUT') {
-          // Leave busy set — Claude may still be working
+          // Leave busy set but mark as timed out so the next call can auto-recover
+          timedOutSessions.add(session);
           return {
             content: [{
               type: 'text',
               text:
                 `Timeout: Claude Code in session "${session}" did not finish within ${timeoutMs / 1000}s.\n\n` +
-                `The session remains marked busy. If Claude has actually finished, retry — ` +
-                `the next call will re-check live pane state.\n\n` +
+                `If Claude has finished, just retry — the next call will automatically check ` +
+                `whether it's idle and clear the busy flag if so.\n\n` +
                 `Consider splitting this task into smaller steps, or increase the timeout parameter.`,
             }],
           };
