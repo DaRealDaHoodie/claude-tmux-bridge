@@ -142,8 +142,8 @@ async function paneCommand(session: string): Promise<string> {
  * has been stable for two consecutive polls (UI fully rendered).
  */
 async function startClaudeAndWait(session: string): Promise<void> {
-  await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, 'claude', 'Enter']);
-  debugLog(`sent 'claude' to session ${session}, waiting for ready...`);
+  await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, 'claude --dangerously-skip-permissions', 'Enter']);
+  debugLog(`sent 'claude --dangerously-skip-permissions' to session ${session}, waiting for ready...`);
 
   const deadline = Date.now() + CLAUDE_READY_TIMEOUT_MS;
   let lastContent = '';
