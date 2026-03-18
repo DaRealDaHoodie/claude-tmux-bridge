@@ -1,12 +1,12 @@
 {
-  "name": "claude-code-mcp",
+  "name": "claude-tmux-bridge",
   "version": "2.0.0",
   "description": "MCP server bridging Claude Desktop to an interactive Claude Code tmux session",
   "author": "DaRealDaHoodie",
   "license": "MIT",
   "main": "dist/server.js",
   "bin": {
-    "claude-code-mcp": "dist/server.js"
+    "claude-tmux-bridge": "dist/server.js"
   },
   "scripts": {
     "build": "tsc",
@@ -33,7 +33,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DaRealDaHoodie/claude-code-mcp.git"
+    "url": "git+https://github.com/DaRealDaHoodie/claude-tmux-bridge.git"
   },
   "keywords": [
     "mcp",
@@ -44,7 +44,7 @@
     "tools"
   ],
   "bugs": {
-    "url": "https://github.com/DaRealDaHoodie/claude-code-mcp/issues"
+    "url": "https://github.com/DaRealDaHoodie/claude-tmux-bridge/issues"
   },
-  "homepage": "https://github.com/DaRealDaHoodie/claude-code-mcp#readme"
+  "homepage": "https://github.com/DaRealDaHoodie/claude-tmux-bridge#readme"
 }

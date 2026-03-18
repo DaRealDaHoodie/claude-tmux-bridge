@@ -25,8 +25,8 @@ Claude Desktop  →  claude_code MCP tool  →  tmux session  →  Claude Code (
 ### 1. Install this server
 
 ```bash
-git clone https://github.com/DaRealDaHoodie/claude-code-mcp.git
-cd claude-code-mcp
+git clone https://github.com/DaRealDaHoodie/claude-tmux-bridge.git
+cd claude-tmux-bridge
 npm install
 npm run build
 ```
@@ -56,9 +56,9 @@ Add this server to your Claude Desktop MCP config (`~/Library/Application Suppor
 ```json
 {
   "mcpServers": {
-    "claude-code-mcp": {
+    "claude-tmux-bridge": {
       "command": "node",
-      "args": ["/path/to/claude-code-mcp/dist/server.js"]
+      "args": ["/path/to/claude-tmux-bridge/dist/server.js"]
     }
   }
 }
