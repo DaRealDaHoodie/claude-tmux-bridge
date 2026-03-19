@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0] - 2026-03-19
+
+### Added
+- `clearContext` parameter — sends `/clear` before the prompt, wiping conversation history. Use when starting a new feature or work session.
+- `compact` parameter — sends `/compact` before the prompt, summarising history via the Claude API. Use when context is growing but continuity still matters. Takes precedence over `clearContext` if both are set.
+- CLAUDE.md guidance for Claude Desktop on when to use each parameter, with examples.
+
 ## [2.2.1] - 2026-03-17
 
 ### Added

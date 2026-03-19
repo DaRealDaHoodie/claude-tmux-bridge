@@ -227,6 +227,20 @@ async function isPaneIdle(session: string): Promise<boolean> {
 }
 
 /**
+ * Send a context management command (/clear or /compact) and wait for
+ * Claude Code to return to its idle prompt before proceeding.
+ *
+ * /clear  — instant, resets conversation history
+ * /compact — calls the Claude API to summarize history; can take 30–60s
+ */
+async function sendContextCommand(session: string, cmd: '/clear' | '/compact'): Promise<void> {
+  const timeoutMs = cmd === '/compact' ? 120_000 : 15_000;
+  await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, cmd, 'Enter']);
+  debugLog(`sent ${cmd} to session ${session}, waiting for ready...`);
+  await waitForStableOutput(session, timeoutMs);
+}
+
+/**
  * Send a prompt to a tmux pane safely, handling all special characters.
  *
  * Uses temp-file → tmux load-buffer → paste-buffer → Enter.
@@ -368,6 +382,21 @@ class ClaudeCodeServer {
               type: 'number',
               description: 'Max seconds to wait for a response (default: 300).',
             },
+            clearContext: {
+              type: 'boolean',
+              description:
+                'Send /clear to the Claude Code session before delivering the prompt. ' +
+                'Wipes conversation history entirely — use when starting a new major feature, ' +
+                'a new work session, or when Claude Code warns about large context. Fast (< 1s).',
+            },
+            compact: {
+              type: 'boolean',
+              description:
+                'Send /compact to the Claude Code session before delivering the prompt. ' +
+                'Summarises conversation history via the Claude API, keeping key context while ' +
+                'freeing up space. Use when context is growing but continuity still matters. ' +
+                'Slower than clearContext (30–60s). If both are set, compact takes precedence.',
+            },
           },
           required: ['prompt'],
         },
@@ -384,6 +413,8 @@ class ClaudeCodeServer {
         prompt?: unknown;
         workFolder?: unknown;
         timeout?: unknown;
+        clearContext?: unknown;
+        compact?: unknown;
       } | undefined;
 
       if (!args?.prompt || typeof args.prompt !== 'string') {
@@ -393,6 +424,8 @@ class ClaudeCodeServer {
       const prompt = args.prompt;
       const workFolder = typeof args.workFolder === 'string' ? args.workFolder : undefined;
       const timeoutMs = (typeof args.timeout === 'number' ? args.timeout : 300) * 1_000;
+      const doCompact = args.compact === true;
+      const doClear   = !doCompact && args.clearContext === true;
       const session = sessionName(workFolder);
 
       debugLog(`call session=${session} timeout=${timeoutMs / 1000}s`);
@@ -475,20 +508,32 @@ class ClaudeCodeServer {
         }
       }
 
-      // ── d. Snapshot before ────────────────────────────────────────────────
+      // ── d. Context management (optional) ─────────────────────────────────
+      if (doCompact || doClear) {
+        const cmd = doCompact ? '/compact' : '/clear';
+        debugLog(`running ${cmd} in session ${session} before prompt`);
+        try {
+          await sendContextCommand(session, cmd);
+        } catch {
+          // Non-fatal — log and continue; worst case context is unchanged
+          debugLog(`${cmd} did not complete cleanly — continuing anyway`);
+        }
+      }
+
+      // ── e. Snapshot before ────────────────────────────────────────────────
       const before = await capturePane(session);
 
-      // ── e. Mark busy ──────────────────────────────────────────────────────
+      // ── f. Mark busy ──────────────────────────────────────────────────────
       busySessions.add(session);
 
       try {
-        // ── f. Send prompt ─────────────────────────────────────────────────
+        // ── g. Send prompt ─────────────────────────────────────────────────
         await sendPrompt(session, prompt);
 
-        // ── g. Wait for completion ─────────────────────────────────────────
+        // ── h. Wait for completion ─────────────────────────────────────────
         const after = await waitForStableOutput(session, timeoutMs);
 
-        // ── h. Extract and return new content ──────────────────────────────
+        // ── i. Extract and return new content ──────────────────────────────
         busySessions.delete(session);
         timedOutSessions.delete(session);
         const response = extractNewContent(before, after);
