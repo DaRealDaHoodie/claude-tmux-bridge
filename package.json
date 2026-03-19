@@ -1,6 +1,6 @@
 {
   "name": "claude-tmux-bridge",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "MCP server bridging Claude Desktop to an interactive Claude Code tmux session",
   "author": "DaRealDaHoodie",
   "license": "MIT",

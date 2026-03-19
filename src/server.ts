@@ -20,7 +20,7 @@ import { join, basename } from 'node:path';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const SERVER_VERSION = '2.2.0';
+const SERVER_VERSION = '2.3.0';
 
 function envInt(name: string, defaultVal: number): number {
   const val = parseInt(process.env[name] ?? '', 10);
