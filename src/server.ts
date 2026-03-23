@@ -243,11 +243,15 @@ async function sendContextCommand(session: string, cmd: '/clear' | '/compact'): 
 /**
  * Send a prompt to a tmux pane safely, handling all special characters.
  *
- * Uses temp-file → tmux load-buffer → paste-buffer.
- * The newline is baked into the file so Enter arrives as part of the same
- * paste operation — guaranteeing it lands after all the text regardless of
- * prompt size. A separate send-keys Enter would race the pty buffer on large
- * prompts (>4096 bytes) and could arrive before the text was fully received.
+ * Belt-and-suspenders approach for reliable Enter delivery on all prompt sizes:
+ *
+ * 1. The newline is baked into the file so it arrives as part of the paste
+ *    buffer — for most prompts this alone is sufficient.
+ * 2. After a short delay, an explicit send-keys Enter is sent as a fallback.
+ *    For very large prompts the pty chunks the paste and the trailing \n can
+ *    land in a separate chunk that Claude Code's input handler misses. The
+ *    fallback Enter catches that case. If the baked \n already submitted,
+ *    the extra Enter simply hits an empty prompt line — harmless.
  */
 async function sendPrompt(session: string, prompt: string): Promise<void> {
   const tmpDir = await mkdtemp(join(tmpdir(), 'claude-mcp-'));
@@ -257,6 +261,8 @@ async function sendPrompt(session: string, prompt: string): Promise<void> {
     await writeFile(tmpFile, prompt + '\n', 'utf8');
     await spawnAsync('tmux', ['load-buffer', '-b', 'claude-mcp', tmpFile]);
     await spawnAsync('tmux', ['paste-buffer', '-b', 'claude-mcp', '-t', `${session}:0.0`]);
+    await sleep(800);
+    await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, 'Enter']);
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
