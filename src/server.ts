@@ -243,19 +243,20 @@ async function sendContextCommand(session: string, cmd: '/clear' | '/compact'): 
 /**
  * Send a prompt to a tmux pane safely, handling all special characters.
  *
- * Uses temp-file → tmux load-buffer → paste-buffer → Enter.
- * This avoids every shell-quoting issue: the file content is treated as
- * opaque bytes by tmux and pasted literally into the pty.
+ * Uses temp-file → tmux load-buffer → paste-buffer.
+ * The newline is baked into the file so Enter arrives as part of the same
+ * paste operation — guaranteeing it lands after all the text regardless of
+ * prompt size. A separate send-keys Enter would race the pty buffer on large
+ * prompts (>4096 bytes) and could arrive before the text was fully received.
  */
 async function sendPrompt(session: string, prompt: string): Promise<void> {
   const tmpDir = await mkdtemp(join(tmpdir(), 'claude-mcp-'));
   const tmpFile = join(tmpDir, 'prompt.txt');
 
   try {
-    await writeFile(tmpFile, prompt, 'utf8');
+    await writeFile(tmpFile, prompt + '\n', 'utf8');
     await spawnAsync('tmux', ['load-buffer', '-b', 'claude-mcp', tmpFile]);
     await spawnAsync('tmux', ['paste-buffer', '-b', 'claude-mcp', '-t', `${session}:0.0`]);
-    await spawnAsync('tmux', ['send-keys', '-t', `${session}:0.0`, 'Enter']);
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
